@@ -12,3 +12,4 @@ serde_json = "1.0.105"
 roaring = "0.10.1"
 memuse = "0.2.1"
 clap = { version = "4.3.19", features = ["derive"] }
+rayon = "1.8.0"

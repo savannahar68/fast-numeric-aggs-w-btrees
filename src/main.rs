@@ -2,9 +2,12 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use memuse::DynamicUsage;
 use rand::Rng;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -77,6 +80,8 @@ struct AggregationIndexTree {
     nodes: Vec<AggregationTreeNode>,
     // Map from original doc_id to position in the tree's sorted values
     doc_id_map: HashMap<u32, usize>,
+    // Map from position to node_idx and offset within node, for faster lookups
+    position_map: Vec<(usize, usize)>, // (node_idx, offset_in_node)
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +134,7 @@ impl NodeAggregations {
     }
 }
 
-// Traditional columnar storage for comparison
+// Traditional columnar storage for comparison for correctness only
 #[derive(Debug, Clone)]
 struct ColumnarStorage {
     values: Vec<f64>,
@@ -237,10 +242,18 @@ fn build_aggregation_index_tree(values: &[(u32, f64)], leaf_size: usize) -> Aggr
     // Make sure the root is index 0 by building the tree from index 0
     build_tree_recursive(&mut nodes, values, 0, values.len(), leaf_size);
     
-    AggregationIndexTree { 
+    // Create position map for faster value lookups
+    let mut position_map = vec![(0, 0); values.len()];
+    build_position_map(&nodes, 0, &mut position_map, 0);
+    
+    // Build tree first
+    let tree = AggregationIndexTree { 
         nodes,
         doc_id_map,
-    }
+        position_map,
+    };
+    
+    tree
 }
 
 fn build_tree_recursive(
@@ -327,6 +340,31 @@ fn build_tree_recursive(
     current_idx
 }
 
+// Build a map from global position to (node_idx, offset) for fast lookups
+fn build_position_map(nodes: &[AggregationTreeNode], node_idx: usize, 
+                     position_map: &mut [(usize, usize)], start_pos: usize) -> usize {
+    match &nodes[node_idx] {
+        AggregationTreeNode::Internal { left, right, .. } => {
+            // First map positions in left subtree
+            let left_size = build_position_map(nodes, *left, position_map, start_pos);
+            
+            // Then map positions in right subtree
+            let right_size = build_position_map(nodes, *right, position_map, start_pos + left_size);
+            
+            // Return total size
+            left_size + right_size
+        },
+        AggregationTreeNode::Leaf { values, .. } => {
+            // Map all positions in this leaf
+            for i in 0..values.len() {
+                position_map[start_pos + i] = (node_idx, i);
+            }
+            
+            values.len()
+        }
+    }
+}
+
 // Query functions for AIT
 impl AggregationIndexTree {
     fn get_global_aggregations(&self) -> NodeAggregations {
@@ -345,15 +383,175 @@ impl AggregationIndexTree {
             return NodeAggregations::empty();
         }
         
-        // Direct lookup for all bitmaps
+        // Get global aggregations count
+        let global_aggs = self.get_global_aggregations();
+        
+        // If bitmap is empty, return empty result
+        if bitmap.is_empty() {
+            return NodeAggregations::empty();
+        }
+        
+        // If bitmap includes all documents, return global aggregations
+        if bitmap.len() as u32 == global_aggs.count {
+            return global_aggs.clone();
+        }
+        
+        // If bitmap is very large (>80% of total), use complement approach
+        if bitmap.len() as u32 > global_aggs.count * 80 / 100 {
+            // Calculate complement of the bitmap and subtract from global
+            let mut complement = RoaringBitmap::new();
+            for i in 0..global_aggs.count {
+                if !bitmap.contains(i) {
+                    complement.insert(i);
+                }
+            }
+            
+            // If complement is empty, return global aggregations (safeguard)
+            if complement.is_empty() {
+                return global_aggs.clone();
+            }
+            
+            // Get aggregations for excluded docs
+            let excluded_aggs = self.direct_query_sequential(&complement);
+            
+            // Subtract from global
+            return NodeAggregations {
+                min_value: global_aggs.min_value,
+                max_value: global_aggs.max_value, 
+                sum: global_aggs.sum - excluded_aggs.sum,
+                count: global_aggs.count - excluded_aggs.count,
+            };
+        }
+        
+        // Use direct lookup for small or non-sequential bitmaps
+        if bitmap.len() < 10_000 {
+            self.direct_query_sequential(bitmap)
+        } else {
+            self.direct_query_parallel(bitmap)
+        }
+    }
+    
+    // Check if a bitmap is mostly sorted (useful for range queries)
+    fn is_sorted_bitmap(&self, bitmap: &RoaringBitmap) -> bool {
+        let mut prev = None;
+        let mut consecutive_count = 0;
+        let mut total = 0;
+        
+        for doc_id in bitmap.iter() {
+            total += 1;
+            if let Some(prev_id) = prev {
+                if doc_id == prev_id + 1 {
+                    consecutive_count += 1;
+                }
+            }
+            prev = Some(doc_id);
+        }
+        
+        // If at least 70% of the bitmap is consecutive values, consider it sorted
+        total > 0 && consecutive_count as f64 / total as f64 > 0.7
+    }
+    
+    // Use direct position lookup for efficiency with small bitmaps
+    fn direct_query_with_bitmap(&self, bitmap: &RoaringBitmap) -> NodeAggregations {
+        // For very small bitmaps, use single-threaded processing
+        if bitmap.len() < 10_000 {
+            return self.direct_query_sequential(bitmap);
+        }
+        
+        // For larger bitmaps, use parallel processing
+        self.direct_query_parallel(bitmap)
+    }
+    
+    // Sequential processing for small bitmaps
+    fn direct_query_sequential(&self, bitmap: &RoaringBitmap) -> NodeAggregations {
         let mut result = NodeAggregations::empty();
+        
+        // Collect all positions first
+        let mut positions = Vec::with_capacity(bitmap.len() as usize);
         
         for doc_id in bitmap.iter() {
             // Look up the position in the sorted array
             if let Some(&pos) = self.doc_id_map.get(&doc_id) {
+                positions.push(pos);
+            }
+        }
+        
+        // Sort positions for better cache locality - this improves performance by reducing cache misses
+        positions.sort_unstable();
+        
+        // Process positions in batches
+        const BATCH_SIZE: usize = 1024;
+        for chunk in positions.chunks(BATCH_SIZE) {
+            self.process_position_batch(&mut result, chunk);
+        }
+        
+        result
+    }
+    
+    // Parallel processing for large bitmaps
+    fn direct_query_parallel(&self, bitmap: &RoaringBitmap) -> NodeAggregations {
+        // Share self reference across threads
+        let tree = Arc::new(self);
+        
+        // Collect all positions first
+        let positions: Vec<usize> = bitmap.iter()
+            .filter_map(|doc_id| tree.doc_id_map.get(&doc_id).map(|&pos| pos))
+            .collect();
+        
+        // No positions found
+        if positions.is_empty() {
+            return NodeAggregations::empty();
+        }
+        
+        // Sort positions for better cache locality
+        // If need more performance, we could use parallel sort
+        let mut sorted_positions = positions;
+        sorted_positions.sort_unstable();
+        
+        // Split into chunks for parallel processing - adjust chunk size based on number of cores
+        const CHUNK_SIZE: usize = 50_000;
+        let chunks: Vec<&[usize]> = sorted_positions.chunks(CHUNK_SIZE).collect();
+        
+        // Process each chunk in parallel
+        let results: Vec<NodeAggregations> = chunks.par_iter()
+            .map(|chunk| {
+                let mut local_result = NodeAggregations::empty();
+                
+                // Process chunk in batches for better cache performance
+                const BATCH_SIZE: usize = 1024;
+                for batch in chunk.chunks(BATCH_SIZE) {
+                    tree.process_position_batch(&mut local_result, batch);
+                }
+                
+                local_result
+            })
+            .collect();
+        
+        // Combine results
+        results.iter().fold(NodeAggregations::empty(), |acc, aggs| {
+            if acc.count == 0 {
+                aggs.clone()
+            } else if aggs.count == 0 {
+                acc
+            } else {
+                NodeAggregations {
+                    min_value: acc.min_value.min(aggs.min_value),
+                    max_value: acc.max_value.max(aggs.max_value),
+                    sum: acc.sum + aggs.sum,
+                    count: acc.count + aggs.count,
+                }
+            }
+        })
+    }
+    
+    // Batch process positions for better cache utilization
+    #[inline]
+    fn process_position_batch(&self, result: &mut NodeAggregations, positions: &[usize]) {
+        // For small batches, use direct processing
+        if positions.len() < 32 {
+            for &pos in positions {
                 let value = self.get_value_at_position(pos);
                 
-                // Update aggregations
                 if result.count == 0 {
                     result.min_value = value;
                     result.max_value = value;
@@ -364,14 +562,173 @@ impl AggregationIndexTree {
                 result.sum += value;
                 result.count += 1;
             }
+            return;
         }
         
-        result
+        // For larger batches, use vectorized processing
+        let mut min_val = f64::MAX;
+        let mut max_val = f64::MIN;
+        let mut sum_val = 0.0;
+        let mut count = 0;
+        
+        // Use chunk size optimized for cache line size
+        const CHUNK_SIZE: usize = 16; // Fits well in L1 cache line
+        
+        for chunk in positions.chunks(CHUNK_SIZE) {
+            for &pos in chunk {
+                let value = self.get_value_at_position(pos);
+                min_val = min_val.min(value);
+                max_val = max_val.max(value);
+                sum_val += value;
+                count += 1;
+            }
+        }
+        
+        // Update the final result
+        if count > 0 {
+            if result.count == 0 {
+                result.min_value = min_val;
+                result.max_value = max_val;
+            } else {
+                result.min_value = result.min_value.min(min_val);
+                result.max_value = result.max_value.max(max_val);
+            }
+            result.sum += sum_val;
+            result.count += count;
+        }
+    }
+    
+    // Recursive range query that tries to use pre-aggregated nodes when possible
+    fn recursive_range_query(&self, result: &mut NodeAggregations, node_idx: usize, 
+                            start_pos: usize, end_pos: usize) {
+        match &self.nodes[node_idx] {
+            AggregationTreeNode::Internal { left, right, aggregations, .. } => {
+                // Determine the positions covered by the left child
+                let left_size = match &self.nodes[*left] {
+                    AggregationTreeNode::Internal { aggregations, .. } => aggregations.count as usize,
+                    AggregationTreeNode::Leaf { values, .. } => values.len(),
+                };
+                
+                // Calculate range overlap with left and right children
+                let left_start = 0;
+                let left_end = left_size - 1;
+                let right_start = left_size;
+                let right_end = right_start + match &self.nodes[*right] {
+                    AggregationTreeNode::Internal { aggregations, .. } => aggregations.count as usize,
+                    AggregationTreeNode::Leaf { values, .. } => values.len(),
+                } - 1;
+                
+                // Check if the range fully covers this node
+                if start_pos <= left_start && end_pos >= right_end {
+                    // Use pre-calculated aggregations for this node
+                    if result.count == 0 {
+                        *result = aggregations.clone();
+                    } else {
+                        result.min_value = result.min_value.min(aggregations.min_value);
+                        result.max_value = result.max_value.max(aggregations.max_value);
+                        result.sum += aggregations.sum;
+                        result.count += aggregations.count;
+                    }
+                    return;
+                }
+                
+                // Check if range overlaps with left child
+                if start_pos <= left_end && end_pos >= left_start {
+                    let overlap_start = start_pos.max(left_start);
+                    let overlap_end = end_pos.min(left_end);
+                    
+                    // If range fully contains left child, use pre-calculated aggregations
+                    if overlap_start == left_start && overlap_end == left_end {
+                        let left_aggs = match &self.nodes[*left] {
+                            AggregationTreeNode::Internal { aggregations, .. } => aggregations,
+                            AggregationTreeNode::Leaf { aggregations, .. } => aggregations,
+                        };
+                        
+                        if result.count == 0 {
+                            *result = left_aggs.clone();
+                        } else {
+                            result.min_value = result.min_value.min(left_aggs.min_value);
+                            result.max_value = result.max_value.max(left_aggs.max_value);
+                            result.sum += left_aggs.sum;
+                            result.count += left_aggs.count;
+                        }
+                    } else {
+                        // Otherwise recurse into left child
+                        self.recursive_range_query(result, *left, overlap_start, overlap_end);
+                    }
+                }
+                
+                // Check if range overlaps with right child
+                if start_pos <= right_end && end_pos >= right_start {
+                    let overlap_start = start_pos.max(right_start);
+                    let overlap_end = end_pos.min(right_end);
+                    
+                    // If range fully contains right child, use pre-calculated aggregations
+                    if overlap_start == right_start && overlap_end == right_end {
+                        let right_aggs = match &self.nodes[*right] {
+                            AggregationTreeNode::Internal { aggregations, .. } => aggregations,
+                            AggregationTreeNode::Leaf { aggregations, .. } => aggregations,
+                        };
+                        
+                        if result.count == 0 {
+                            *result = right_aggs.clone();
+                        } else {
+                            result.min_value = result.min_value.min(right_aggs.min_value);
+                            result.max_value = result.max_value.max(right_aggs.max_value);
+                            result.sum += right_aggs.sum;
+                            result.count += right_aggs.count;
+                        }
+                    } else {
+                        // Otherwise recurse into right child with adjusted positions
+                        self.recursive_range_query(result, *right, 
+                            overlap_start - right_start, overlap_end - right_start);
+                    }
+                }
+            },
+            AggregationTreeNode::Leaf { values, .. } => {
+                // Process the leaf node directly
+                for i in start_pos..=end_pos.min(values.len() - 1) {
+                    let value = values[i];
+                    if result.count == 0 {
+                        result.min_value = value;
+                        result.max_value = value;
+                    } else {
+                        result.min_value = result.min_value.min(value);
+                        result.max_value = result.max_value.max(value);
+                    }
+                    result.sum += value;
+                    result.count += 1;
+                }
+            }
+        }
     }
     
     // Helper method to find a value at a given position in the sorted array
+    #[inline(always)]
     fn get_value_at_position(&self, pos: usize) -> f64 {
-        // Start from the root node and traverse to find the right leaf
+        // Fast path: direct lookup using position map
+        if pos < self.position_map.len() {
+            let (node_idx, offset) = self.position_map[pos];
+            
+            // Directly use unchecked indexing for performance in release mode
+            #[cfg(debug_assertions)]
+            {
+                if let AggregationTreeNode::Leaf { values, .. } = &self.nodes[node_idx] {
+                    if offset < values.len() {
+                        return values[offset];
+                    }
+                }
+            }
+            
+            #[cfg(not(debug_assertions))]
+            unsafe {
+                if let AggregationTreeNode::Leaf { values, .. } = &self.nodes.get_unchecked(node_idx) {
+                    return *values.get_unchecked(offset);
+                }
+            }
+        }
+        
+        // Fallback to tree traversal if position map lookup fails
         self.find_value_recursive(0, pos)
     }
 
@@ -494,14 +851,28 @@ fn run_benchmark(args: &Args) {
     };
     let columnar_build_time = start.elapsed();
     println!("Columnar storage build time: {:?}", columnar_build_time);
+
+    // drop vars which are no longer needed
+    drop(docs);
+    drop(values);
+
+    sleep(std::time::Duration::from_secs(10));
     
     // Generate random document IDs for filtered query
     println!("Generating random document IDs for filtered query...");
     let mut rng = rand::thread_rng();
     let filter_count = (args.num_docs * args.filter_percentage) / 100;
     let mut filter_bitmap = RoaringBitmap::new();
-    while filter_bitmap.len() < filter_count as u64 {
-        filter_bitmap.insert(rng.gen_range(0..args.num_docs as u32));
+    let mut unique_ids = std::collections::HashSet::new(); // To ensure uniqueness
+
+    while unique_ids.len() < filter_count {
+        let random_id = rng.gen_range(0..args.num_docs as u32);
+        unique_ids.insert(random_id);
+    }
+
+    // Insert unique IDs into the bitmap
+    for id in unique_ids {
+        filter_bitmap.insert(id);
     }
     
     // Memory usage
